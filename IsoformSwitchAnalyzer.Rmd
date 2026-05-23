@@ -1,0 +1,465 @@
+---
+title: "Transcript_usage:Impact_of_TRIM2_knockdown_on_binding_with_other_RNA_molecules_involved_in_neuronal_development"
+author: "Rashi"
+date: "2024-03-11"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## IsoformSwitchAnalyzeR
+
+IsoformSwitchAnalyzeR enables analysis of RNA-seq data with isoform resolution with a focus on isoform switching (with predicted consequences) and its associated alternative splicing, thereby expanding the usability of RNA-seq data.
+
+We start with loading library for R
+
+```{r library}
+library(IsoformSwitchAnalyzeR)
+library("BSgenome.Hsapiens.UCSC.hg38")
+```
+
+## set seed
+
+```{r set seed}
+set.seed(129)
+```
+
+## Import quantified expression data from stringtie
+
+IsoformSwitchAnalyzeR provides a function 'importIsoformExpression' that will allow to import the quantified expression data from different plateforms. Here, we importing the data from StringTie v2.2.1.
+
+```{r Import data,echo=TRUE}
+data <- "/data"
+stringQuant <- importIsoformExpression(
+  data,
+  addIsofomIdAsColumn = TRUE,
+  readLength = 75
+)
+
+head(stringQuant$abundance, 20)
+head(stringQuant$counts, 20)
+```
+
+# Make Design Matrix
+
+A design matrix indicating which of the independent biological replicates belong to which condition (and if there are other covariates (incl batch effects) that should be taking into account).
+
+```{r }
+myDesign <- data.frame(
+  sampleID = colnames(stringQuant$abundance)[-1],
+  condition = gsub('.*_(.*)\\d+', '\\1', colnames(stringQuant$abundance)[-1])
+)
+
+myDesign
+```
+
+# Create switchAnalyzeRlist
+
+Now that we have the isoform quantifications, the design matrix,and the isoform annotation (respectively in a GTF file generated through stringtie merge stored on the computer, IsoformSwitchAnalyzeR will import itself) we can now integrate it all into a switchAnalyzeRlist.
+
+```{r, warning = FALSE}
+gtf <- "stringtie_merged.gtf"
+
+aSwitchList_str <- importRdata(
+  isoformCountMatrix   = stringQuant$counts,
+  isoformRepExpression = stringQuant$abundance,
+  designMatrix         = myDesign,
+  isoformExonAnnoation = gtf,
+  isoformNtFasta       = NULL,
+  showProgress = FALSE, 
+  ignoreAfterBar = TRUE,
+  ignoreAfterSpace = TRUE, 
+  addAnnotatedORFs=TRUE,
+  ignoreAfterPeriod=FALSE,
+)
+
+summary(aSwitchList_str)
+```
+
+# Filtering
+
+Now, we have a switchAnalyzeRlist, so, there is a good chance that it contains a lot of genes/isoforms that are irrelevant for an analysis of isoform switches. Examples of such could be single isoform genes or non-expressed isoforms. These extra genes/isoforms will make the downstream analysis take (much) longer than necessary. So, we filter thoese fetures before continuing with the analysis.
+
+```{r}
+aSwitchListFiltered <- preFilter(
+  switchAnalyzeRlist = aSwitchList_str,
+  geneExpressionCutoff = 10,
+  isoformExpressionCutoff = 3,
+  removeSingleIsoformGenes = TRUE
+)
+
+summary(aSwitchListFiltered)
+```
+
+#Identifying Isoform Switches As identification of isoform switches are essential for IsoformSwitchAnalyzeR, multiple ways of identifying isoform switches are supported. Currently IsoformSwitchAnalyzeR directly supports three different approaches (DEXSeq, satuRn, Cufflinks). We are using DEXSeq here.
+
+```{r, warning=FALSE}
+# Isoform Switches via DEXSeq
+dexseqSwitchListAnalyzed <- isoformSwitchTestDEXSeq(
+  switchAnalyzeRlist = aSwitchListFiltered,
+  reduceToSwitchingGenes=TRUE
+)
+
+extractSwitchSummary(dexseqSwitchListAnalyzed)
+
+# Save results as csv file
+write.csv(dexseqSwitchListAnalyzed$isoformSwitchAnalysis, "isoform_switch_analysis_DEXSeq.csv", row.names = FALSE)
+```
+
+# Analyzing Open Reading Frames
+
+Once the isoform switches have been found, the next step is to annotate the isoforms involved in the isoform switches. Essential to this process is the annotation of Open Reading Frames (ORFs).
+
+```{r}
+# step 1. Annotate ORFs
+aSwitchList_ORF = addORFfromGTF(dexseqSwitchListAnalyzed,
+                                pathToGTF = "extdata/Homo_sapiens.GRCh38.109.gtf", ignoreAfterPeriod = TRUE,
+                                PTCDistance = 50,
+                                overwriteExistingORF = FALSE,
+                                onlyConsiderFullORF = FALSE,
+                                removeNonConvensionalChr = FALSE,
+                                ignoreAfterBar = TRUE,
+                                ignoreAfterSpace = TRUE,
+                                quiet = FALSE
+)
+# step 2. Analyzing Known and Novel Isoforms
+novelIsoformORF <- analyzeNovelIsoformORF(
+  aSwitchList_ORF,
+  analysisAllIsoformsWithoutORF = TRUE, # also analyse all those annotated as without CDS in ref annotation
+  genomeObject = Hsapiens,
+  minORFlength = 100,
+  orfMethod = 'longest.AnnotatedWhenPossible', # alterantive method = longest
+  PTCDistance = 50,
+  startCodons = "ATG",
+  stopCodons = c("TAA", "TAG", "TGA"),
+  showProgress = TRUE,
+  quiet = FALSE
+)
+
+table(novelIsoformORF$orfAnalysis$orf_origin)
+```
+
+# Extracting Nucleotide and Amino Acid Sequences
+
+Since we know the CDS/ORF of a transcript, we can obtain the corresponding protein amino acid sequence of the ORF simply by translating the nucleotide sequence of the ORF into amino acids. This opens the possibility for performing both internal and external sequence analysis which enables us to annotate the isoforms involved in isoform switches even further.
+
+```{r, warning=FALSE}
+dexseqSwitchListAnalyzed <- extractSequence(
+  novelIsoformORF,
+  genomeObject = Hsapiens,
+  writeToFile=TRUE # to avoid output when running example data
+)
+```
+
+# Importing External Sequence Analysis
+
+After the external sequence analysis with have been performed, the results from the different tools (CPAT or CPC2, pfam, SignalP, NetSurfP-2 or IUPred2A, analyzeDeepTMHMM, analyzeDeepLoc2) can be extracted and incorporated in the switchAnalyzeRlist via respectively:
+
+```{r}
+
+### Add CPC2 analysis
+dexseqSwitchListAnalyzed <- analyzeCPC2(
+  switchAnalyzeRlist   = dexseqSwitchListAnalyzed,
+  pathToCPC2resultFile = "extdata/result_cpc2.txt",
+  codingCutoff         = 0.725, # the coding potential cutoff we suggested for human
+  removeNoncodinORFs   = TRUE   # because ORF was predicted de novo
+)
+
+### Add PFAM analysis
+dexseqSwitchListAnalyzed <- analyzePFAM(
+  switchAnalyzeRlist   = dexseqSwitchListAnalyzed,
+  pathToPFAMresultFile = "extdata/pfam.txt",
+  showProgress=FALSE
+)
+
+### Add SignalP analysis
+dexseqSwitchListAnalyzed <- analyzeSignalP(
+  switchAnalyzeRlist       = dexseqSwitchListAnalyzed,
+  pathToSignalPresultFile  = "extdata/SignalP_results.txt"
+)
+
+### Add DeepLoc2 analysis
+dexseqSwitchListAnalyzed <- analyzeDeepLoc2(
+  switchAnalyzeRlist = dexseqSwitchListAnalyzed,
+  pathToDeepLoc2resultFile = "extdata/deepLock_result.csv",
+  quiet = FALSE
+)
+
+### Add DeepTMHMM analysis
+dexseqSwitchListAnalyzed <- analyzeDeepTMHMM(
+  switchAnalyzeRlist   = dexseqSwitchListAnalyzed,
+  pathToDeepTMHMMresultFile = "extdata/TMRs.gff3",
+  showProgress=FALSE
+)
+
+### Add IUPred2A analysis
+dexseqSwitchListAnalyzed <- analyzeIUPred2A(
+  switchAnalyzeRlist        = dexseqSwitchListAnalyzed,
+  pathToIUPred2AresultFile = "extdata/isoformSwitchAnalyzeR_isoform_AA.result",
+  showProgress = FALSE
+)
+
+```
+
+# Predicting Alternative Splicing
+
+Another type of annotation we easily can obtain, since we know the exon structure of all isoforms in a given gene (with isoform switching), is alternative splicing. Here intron retention events are of particular interest as a consequence in isoform switches since they represent the largest changes in isoforms.
+
+```{r, warning=FALSE}
+# Predicting alternative splicing
+intronRetention_DexSeq <- analyzeAlternativeSplicing(
+  switchAnalyzeRlist = dexseqSwitchListAnalyzed,
+  quiet=TRUE
+)
+
+table(intronRetention_DexSeq$AlternativeSplicingAnalysis$IR)
+
+## Global splicing analysis:extractSplicingSummary
+extractSplicingSummary(
+  intronRetention_DexSeq,
+  asFractionTotal = FALSE,
+  plotGenes=FALSE
+)
+
+## Global splicing analysis:splicingEnrichment
+splicingEnrichment <- extractSplicingEnrichment(
+  intronRetention_DexSeq,
+  splicingToAnalyze='all',
+  returnResult=TRUE,
+  returnSummary=TRUE
+)
+
+# extractSplicingGenomeWide
+extractSplicingGenomeWide(
+  intronRetention_DexSeq,
+  featureToExtract = 'all',                 # all isoforms stored in the switchAnalyzeRlist
+  splicingToAnalyze = c('A3','MES','ATSS'), # Splice types significantly enriched in COAD
+  plot=TRUE,
+  returnResult=FALSE  # Preventing the summary statistics to be returned as a data.frame
+)
+
+# volcano like plot
+ggplot(data=intronRetention_DexSeq$isoformFeatures, aes(x=dIF, y=-log10(isoform_switch_q_value))) +
+  geom_point(
+    aes( color=abs(dIF) > 0.1 & isoform_switch_q_value < 0.05 ), # default cutoff
+    size=1
+  ) +
+  geom_hline(yintercept = -log10(0.05), linetype='dashed') + # default cutoff
+  geom_vline(xintercept = c(-0.1, 0.1), linetype='dashed') + # default cutoff
+  facet_wrap( ~ condition_2) +
+  #facet_grid(condition_1 ~ condition_2) + # alternative to facet_wrap if you have overlapping conditions
+  scale_color_manual('Signficant\nIsoform Switch', values = c('black','red')) +
+  labs(x='dIF', y='-Log10 ( Isoform Switch Q Value )') +
+  theme_bw()
+
+### Switch vs Gene changes:
+ggplot(data=intronRetention_DexSeq$isoformFeatures, aes(x=gene_log2_fold_change, y=dIF)) +
+  geom_point(
+    aes( color=abs(dIF) > 0.1 & isoform_switch_q_value < 0.05 ), # default cutoff
+    size=1
+  ) + 
+  facet_wrap(~ condition_2) +
+  #facet_grid(condition_1 ~ condition_2) + # alternative to facet_wrap if you have overlapping conditions
+  geom_hline(yintercept = 0, linetype='dashed') +
+  geom_vline(xintercept = 0, linetype='dashed') +
+  scale_color_manual('Signficant\nIsoform Switch', values = c('black','red')) +
+  labs(x='Gene log2 fold change', y='dIF') +
+  theme_bw()
+```
+
+# Predicting Switch Consequences
+
+```{r}
+consequencesOfInterest <- c('intron_retention','coding_potential','NMD_status','domains_identified','ORF_seq_similarity')
+
+aSwitchListAnalyzed <- analyzeSwitchConsequences(
+    intronRetention_DexSeq,
+    consequencesToAnalyze = consequencesOfInterest, 
+    dIFcutoff = 0.4, # very high cutoff for fast runtimes - you should use the default (0.1)
+    showProgress=FALSE
+)
+
+extractSwitchSummary(aSwitchListAnalyzed, dIFcutoff = 0.4, filterForConsequences = FALSE)
+
+extractSwitchSummary(aSwitchListAnalyzed, dIFcutoff = 0.4, filterForConsequences = TRUE)
+```
+
+# Post Analysis of Isoform Switches with Consequences
+
+```{r, warning=FALSE}
+# Analysis of Individual Isoform Switching
+# Postanalysis
+aSwitchListAnalyzedSubset <- subsetSwitchAnalyzeRlist(
+  aSwitchListAnalyzed, 
+  intronRetention_DexSeq$isoformFeatures$condition_1 == 'C'
+)
+
+### overview of number of intron retentions (IR)
+aSwitchListAnalyzedSubset
+
+### Extract top switching genes (by q-value)
+extractTopSwitches(
+    aSwitchListAnalyzedSubset, 
+    filterForConsequences = TRUE, 
+    n = 10, 
+    sortByQvals = TRUE
+)
+
+### Extract top 10 switching genes (by dIF values)
+extractTopSwitches(
+    aSwitchListAnalyzedSubset, 
+    filterForConsequences = TRUE, 
+    n = 10, 
+    sortByQvals = FALSE
+)
+
+### Extract data.frame with all switching isoforms
+switchingIso <- extractTopSwitches( 
+    aSwitchListAnalyzedSubset, 
+    filterForConsequences = TRUE, 
+    n = NA,                  # n=NA: all features are returned
+    extractGenes = FALSE,    # when FALSE isoforms are returned
+    sortByQvals = TRUE
+)
+
+subset(switchingIso, gene_name == 'PHB2')
+
+switchPlot(aSwitchListAnalyzedSubset, gene = 'PHB2')
+
+gene_names <- unique(switchingIso$gene_id)
+
+for (gene in gene_names) {
+    switchPlot(aSwitchListAnalyzedSubset, gene = gene)
+}
+```
+
+#Analyzing the Biological Mechanisms Behind Isoform Switching
+
+```{r}
+### Reduce datasize for fast runtime
+selectedGenes <- unique(aSwitchListAnalyzedSubset$isoformFeatures$gene_id)[50:100]
+aSwitchListAnalyzedSubset_1 <- subsetSwitchAnalyzeRlist(
+    aSwitchListAnalyzedSubset,
+    aSwitchListAnalyzedSubset$isoformFeatures$gene_id %in% selectedGenes
+)
+
+### analyze the biological mechanisms
+bioMechanismeAnalysis <- analyzeSwitchConsequences(
+    aSwitchListAnalyzedSubset_1, 
+    consequencesToAnalyze = c('tss','tts','intron_structure'),
+    showProgress = FALSE
+)$switchConsequence # only the consequences are interesting here
+
+### subset to those with differences
+bioMechanismeAnalysis <- bioMechanismeAnalysis[which(bioMechanismeAnalysis$isoformsDifferent),]
+
+### extract the consequences of interest already stored in the switchAnalyzeRlist
+myConsequences <- aSwitchListAnalyzedSubset$switchConsequence
+myConsequences <- myConsequences[which(myConsequences$isoformsDifferent),]
+myConsequences$isoPair <- paste(myConsequences$isoformUpregulated, myConsequences$isoformDownregulated) # id for specific iso comparison
+
+### Obtain the mechanisms of the isoform switches with consequences
+bioMechanismeAnalysis$isoPair <- paste(bioMechanismeAnalysis$isoformUpregulated, bioMechanismeAnalysis$isoformDownregulated)
+bioMechanismeAnalysis <- bioMechanismeAnalysis[which(bioMechanismeAnalysis$isoPair %in% myConsequences$isoPair),]  # id for specific iso comparison
+```
+
+#This result is best summarized in a Venn diagram:
+```{r}
+### Create list with the isoPair ids for each consequence
+AS   <- bioMechanismeAnalysis$isoPair[ which( bioMechanismeAnalysis$featureCompared == 'intron_structure')]
+aTSS <- bioMechanismeAnalysis$isoPair[ which( bioMechanismeAnalysis$featureCompared == 'tss'             )]
+aTTS <- bioMechanismeAnalysis$isoPair[ which( bioMechanismeAnalysis$featureCompared == 'tts'             )]
+
+mechList <- list(
+    AS=AS,
+    aTSS=aTSS,
+    aTTS=aTTS
+)
+
+### Create Venn diagram
+library(VennDiagram)
+#> Loading required package: grid
+#> Loading required package: futile.logger
+#> 
+#> Attaching package: 'futile.logger'
+#> The following object is masked from 'package:mgcv':
+#> 
+#>     scat
+myVenn <- venn.diagram(
+    x = mechList,
+    col='transparent',
+    alpha=0.4,
+    fill=RColorBrewer::brewer.pal(n=3,name='Dark2'),
+    filename=NULL
+)
+
+### Plot the venn diagram
+grid.newpage() ; grid.draw(myVenn)
+```
+
+
+```{r}
+packageVersion('IsoformSwitchAnalyzeR')
+#> [1] '2.3.0'
+
+sessionInfo()
+```
+
+
+
+```{r}
+target <- read.csv(file= 'pheno_data.csv', row.names="sampleID")
+
+myDesign <- data.frame(sampleID = colnames(stringQuant$abundance)[-1],
+condition = target[, 1],  # Assuming the second column in 'target' dataframe is the condition
+sex = target[, 2],    # Adding column 3 from 'target' dataframe
+race = target[, 3]     # Adding column 4 from 'target' dataframe
+)
+myDesign
+```
+
+
+#Define your own comparison between conditions
+
+```{r}
+# Define comparisons to make data frame with additional conditions
+comparisonsToMake <- as.data.frame(
+  rbind(
+    c("NO_Disc", "NO_4-6h"),
+    c("NO_Disc", "NO_Base"),
+    c("NO_4-6h", "NO_Base"),
+    c("YES_Disc", "YES_4-6h"),
+    c("YES_Disc", "YES_Base"),
+    c("YES_4-6h", "YES_Base"),
+    c("NO_Base", "YES_Base"),  
+    c("NO_4-6h", "YES_4-6h"),
+    c("NO_Disc", "YES_Disc")
+  ),
+  stringsAsFactors = FALSE  # Ensure that strings are not converted to factors
+)
+
+#comparisonsToMake = as.data.frame(cbind(condition_1 = c("Control"), condition_2 = c("Stress")), stringsAsFactors = F)
+
+# Rename columns to match the expected format
+colnames(comparisonsToMake) <- c("condition_1", "condition_2")
+
+gtf <- "extdata/stringtie_merged.gtf"
+
+# Import data with additional comparisons
+aSwitchList_str <- importRdata(
+  isoformCountMatrix = stringQuant$counts,
+  isoformRepExpression = stringQuant$abundance,
+  designMatrix = myDesign,
+  isoformExonAnnoation = gtf,
+  isoformNtFasta = NULL,
+  showProgress = FALSE,
+  ignoreAfterBar = TRUE,
+  ignoreAfterSpace = TRUE,
+  addAnnotatedORFs = TRUE,
+  ignoreAfterPeriod = FALSE,
+  comparisonsToMake = comparisonsToMake
+)
+```
+

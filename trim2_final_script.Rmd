@@ -1,0 +1,336 @@
+---
+title: "TRIM2_3Samples"
+author: "Rashi"
+date: "2024-12-17"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load Librarry
+
+```{r}
+library(DESeq2)
+library(pheatmap)
+library(dplyr)
+library(RColorBrewer)
+library(ggplot2)
+library(ggrepel)
+library(sva)
+library(apeglm)
+library(EnhancedVolcano)
+library("calibrate")
+```
+
+# Load Count Data
+
+You can also embed plots, for example:
+
+```{r, echo=TRUE}
+count_data <- read.csv('transcript_count_matrix.csv', header=TRUE,row.names=1)
+colnames(count_data)
+head(count_data)
+```
+# Load sample information
+
+```{r}
+
+sample_info <- read.csv('pheno_data.csv',header=TRUE,row.names=1)
+colnames(sample_info)
+head(sample_info)
+```
+
+# Making sure the row names in sample_info matches to column names in count_data
+# Making sure they are in the same order?
+```{r}
+all(colnames(count_data) %in% rownames(sample_info))		##should be TRUE
+all(colnames(count_data) == rownames(sample_info))			##should be TRUE
+```
+
+# Set factor levels
+```{r}
+sample_info$state <- factor(sample_info$state, levels = c("Control", "Treat"))
+sample_info$batch <- factor(sample_info$batch, levels = c("1", "2", "3"))
+```
+
+# remove batch effect
+```{r}
+batch <- sample_info$batch
+state<- sample_info$state
+data <- as.matrix(count_data)
+adjusted_data <- ComBat_seq(data, batch=batch, group=state)
+```
+#Create a deseq object and import the count data and sample information
+#dds <- DESeqDataSetFromMatrix(countData = count_data, colData = sample_info, design = ~population + state)
+```{r, warning=FALSE}
+dds <- DESeqDataSetFromMatrix(countData = adjusted_data, 
+                              colData = sample_info, 
+                              design = ~state)
+```
+# Set reference for the treatment  vs Control
+```{r}
+dds$state <- factor(dds$state, levels = c("Control","Treat"))
+```
+
+# Filter the genes
+```{r}
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+head(dds)
+```
+# Perform statical test(s) to identify differential expressed genes
+```{r, echo=FALSE, warning=FALSE}
+dds <- DESeq(dds)
+deseq_result <- results(dds) 
+deseq_result
+#write.csv(deseq_result, "1_deseq_results.csv", row.names = TRUE)
+```
+
+# Get the summary
+```{r, warning=FALSE}
+summary(deseq_result)
+```
+
+## Change the adjPval
+```{r, warning=FALSE}
+deseq_result0.05 <- results(dds, alpha = 0.05) 
+summary(deseq_result0.05)
+```
+
+# Change DESEq object to R object (dataframe)
+```{r}
+deseq_result <- as.data.frame(deseq_result0.05)
+class(deseq_result)
+head(deseq_result)
+```
+
+# Order the result table by increasing p value
+```{r}
+deseq_result_ordered <- deseq_result[order(deseq_result$padj),]
+head(deseq_result_ordered)
+#write.csv(deseq_result_ordered, "2_deseq_results_ordered_padj.csv", row.names = TRUE)
+```
+
+# Extract the most DEG due to the treatment.
+# Select the genes with significant change in gene expression (padj<0.05 nas lg2fc <1 and > 1)
+```{r}
+filtered <- deseq_result %>% filter(deseq_result$padj < 0.05)
+filtered <- filtered %>% filter(abs(filtered$log2FoldChange) >1 )       # log2FC
+#filtered <- filtered %>% filter(abs(filtered$log2FoldChange) >0.585 )    # log1.5FC
+dim(deseq_result)
+dim(filtered)
+```
+
+# Save the deseq result as filename.csv
+```{r}
+#write.csv(deseq_result, '3_de_result.all.csv', row.names = TRUE)
+#write.csv(filtered, '4_de_result_filtered.csv', row.names = TRUE)
+```
+
+# Save the normalized counts
+```{r}
+normalized_counts <-counts(dds,normalized=TRUE)
+head(normalized_counts)
+#write.csv(normalized_counts, '5_normalized_counts.csv')
+```
+
+# Visualization
+## Dispersion plot
+```{r}
+plotDispEsts(dds) 
+```
+
+## PCA plot
+## It is a dimensionality reduction technique and in gene expression analysis, it can be used to explain the variance in
+## in gene expression datasets.
+## To generate a PCA plot, we will perform variance stabilization transformation for which we will use vst function in deseq and
+## then we will transformed values to plot pca.
+```{r}
+vsd <- vst(dds,blind=FALSE, fitType='mean')
+pcaData <- plotPCA(vsd, intgroup=c("state", "batch"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(PC1, PC2, color=state, shape=batch)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()
+
+ggplot(pcaData, aes(PC1, PC2, color=state, shape=batch)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) + 
+  coord_fixed() +
+  theme_minimal() +  # Start with minimal theme
+  theme(
+    panel.grid.major = element_blank(),  # Remove major grid lines
+    panel.grid.minor = element_blank(),  # Remove minor grid lines
+    text = element_text(size = 12),  # Adjust general text size
+    plot.title = element_text(size = 14, face = "bold"),  # Adjust title font
+    axis.title = element_text(size = 12, face = "bold"),  # Adjust axis label font
+    axis.text = element_text(size = 12)  # Adjust axis text font size
+  )
+```
+
+## Heatmap
+## Heatmap of sample-to-sample distance matrix (with clustering) based on normalized count.
+```{r}
+sampleDists <- dist(t(assay(vsd)))									### Generate distance matrix
+sampleDistMatrix <- as.matrix(sampleDists)							### Generate sample distance matrix
+colnames(sampleDistMatrix)
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)		### Set color Scheme
+pheatmap(sampleDistMatrix, clustering_distance_rows=sampleDists, 
+         clustering_distance_cols=sampleDists, col=colors)
+
+
+## Heatmap of log transformed normalized count. We will use top 500 genes
+#top_hits <- deseq_result[order(deseq_result$padj), ][1:100,]
+
+top_hits <- filtered[order(filtered$padj), ][1:829,]
+top_hits <- row.names(top_hits)
+top_hits
+rld <- rlog(dds,blind=FALSE)
+annot_info <- as.data.frame(colData(dds)[,c('batch','state')])
+pheatmap(assay(rld)[top_hits,],
+         scale = "row",        # Scale rows (genes)
+         col = colorRampPalette(c("blue", "white", "red"))(100),  # Color scheme
+         breaks = seq(-2, 2, length.out = 101),
+         margins = c(5, 10),   # Adjust margins for labels
+         main = "Heatmap of Top Genes",
+         xlab = "Sample ID",
+         ylab = "Genes",
+         cex.axis = 1,
+         show_colnames = TRUE,
+         show_rownames = FALSE,
+         fontsize_row = 8,
+         cluster_cols = TRUE,
+         cluster_rows = TRUE, annotation_col=annot_info)
+```
+## Heatmap of zscores. 
+```{r}
+cal_z_score <- function(x) {(x-mean(x)) / sd(x)}
+zscore_all <- t(apply(normalized_counts, 1, cal_z_score))
+zscore_subset <- zscore_all[top_hits,]
+pheatmap(zscore_subset)
+```
+
+## Count Plot
+```{r}
+plotCounts(dds, gene=which.min(deseq_result$padj), intgroup="state")
+
+```
+## Boxplot
+```{r}
+boxplot(log10(assays(dds)[["cooks"]]), range=0, las=2)
+```
+
+
+## MA Plot
+```{r}
+plotMA(dds,ylim=c(-2,2))
+```
+
+## remove the noise
+```{r, warning=FALSE}
+resLFC <- lfcShrink(dds,coef="state_Treat_vs_Control", type="normal")
+plotMA(resLFC,ylim=c(-2,2))
+
+
+res_df <- as.data.frame(resLFC)
+ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(color = ifelse(res_df$padj < 0.05, "red", "black")) +
+  labs(x = "log2 Fold Change", y = "-log10(adjusted p-value)", title = "Volcano Plot") +
+  theme_minimal()
+```
+
+## Enhanced Volcano plot
+```{r}
+gene_names <- sapply(strsplit(rownames(deseq_result), "\\|"), function(x) x[2])
+EnhancedVolcano(deseq_result,
+                lab = gene_names,
+                x = 'log2FoldChange',
+                y = 'pvalue',
+                title = 'transcript_TRIM2',
+                pCutoff = 0.05,
+                FCcutoff = 2,
+                pointSize = 1.0,
+                labSize = 3.0,  # Increase label size
+                titleLabSize = 18,  # Increase title label size
+                axisLabSize = 14,  # Increase axis label size
+                xlim=c(-15,25), 
+                ylim=c(0.0,30),
+                legendLabSize = 12)  # Increase legend label size
+```
+
+
+##Expression of TRIM family gene
+```{r}
+new_column_name <- "ID"
+#deseq_result[, new_column_name] <- rownames(deseq_result)
+filtered[, new_column_name] <- rownames(filtered)
+
+# Filter rows containing the word "trim" in any column
+filtered_data <- filtered[grep("trim", filtered$ID, ignore.case = TRUE), ]
+
+top_hits <- row.names(filtered_data)
+top_hits
+
+# Extract expression levels for filtered data
+rld <- rlog(dds,blind=FALSE)
+filtered_expression <- assay(rld)[top_hits,]
+
+# Extract gene names
+genes <- rownames(filtered_expression)
+
+# Iterate over each gene
+for (gene in genes) {
+  # Extract expression levels for the current gene
+  gene_expression <- filtered_expression[gene, ]
+  
+  # Create a bar plot for the current gene
+  barplot(gene_expression,
+          main = paste(gene),
+          xlab = "Samples",
+          ylab = "Expression",
+          col = c("purple", "yellow"), # Different colors for control and treatment
+          ylim = c(0, max(filtered_expression) * 1.2),
+          beside = TRUE, # Plot bars beside each other
+          names.arg = c("G1_C1", "G1_T1", "G2_C2", "G2_T2", "G3_C3", "G3_T3")) # Sample names
+  
+  # Add legend
+  legend("topright", legend = c("Control", "Treatment"), fill = c("purple", "yellow"))
+}
+```
+
+#### GO Analysis
+#RUN DAIVD with your genes and save data sheet as txt and import dataset from txt into R as data frame
+```{r}
+bp_trim2 <- read.delim("5_bp_trim2_gene.txt")
+filtered_data <- subset(bp_trim2, FDR < 0.05)
+
+library(ggplot2)
+library(dplyr)
+
+# Sort the filtered data based on Fold.Enrichment
+sorted_data <- filtered_data %>% arrange(desc(Fold.Enrichment))
+
+# Reorder the levels of the Term factor based on the sorted Fold.Enrichment
+sorted_data$Term <- factor(sorted_data$Term, levels = sorted_data$Term)
+
+# Create the lollipop chart
+# Create the lollipop chart
+lollipop_plot <- ggplot(sorted_data, aes(x = Fold.Enrichment, y = Term, color = FDR, size = 1/FDR)) +
+  geom_segment(aes(xend = 0, yend = Term), size = 1) +  # Draw the line segment with constant size
+  geom_point(shape = 19, aes(size = 1/FDR), alpha = 0.6) +  # Draw the lollipop points with size mapped to Count
+  scale_color_gradient(low = "red", high = "blue") +  # Color gradient for FDR
+  labs(x = "Fold Enrichment", y = "Term", color = "FDR", size = "FDR") +  # Axis labels
+  theme_minimal() +  # Minimal theme
+  theme(legend.position = "bottom")  # Position of the legend
+
+# Show the plot
+print(lollipop_plot)
+```
+
